@@ -69,18 +69,25 @@ function DebtForm() {
 
   const handleChange = (e) => {
     const { name, value } = e.target;
-    setFormData({
-      ...formData,
-      [name]: value
+    
+    setFormData(prev => {
+      const newFormData = { ...prev, [name]: value };
+      
+      // Auto-set current balance ONLY when:
+      // 1. Creating new debt (not editing)
+      // 2. We're changing total amount field
+      // 3. Current balance is empty or matches old total amount (not manually modified)
+      if (name === 'totalAmnt' && !isEditing) {
+        const wasCurrentBalSameAsOldTotal = prev.currentBal === prev.totalAmnt;
+        const isCurrentBalEmpty = !prev.currentBal;
+        
+        if (isCurrentBalEmpty || wasCurrentBalSameAsOldTotal) {
+          newFormData.currentBal = value;
+        }
+      }
+      
+      return newFormData;
     });
-
-    // If editing total amount and current balance is empty, auto-set current balance
-    if (name === 'totalAmnt' && !isEditing && !formData.currentBal && value) {
-      setFormData(prev => ({
-        ...prev,
-        currentBal: value
-      }));
-    }
   };
 
   const handleSubmit = async (e) => {
