@@ -1,4 +1,4 @@
-// src/components/BankAccountList.jsx - COMPLETE FIXED VERSION
+// src/components/BankAccountList.jsx - COMPLETE VERSION WITH TRANSACTIONAL DELETE
 import { useState, useEffect } from 'react';
 import { auth, db } from '../firebase';
 import { 
@@ -11,29 +11,50 @@ import {
   Button,
   Paper,
   Divider,
-  IconButton,
   Chip,
   CircularProgress,
-  Alert // ADDED THIS IMPORT
+  Alert,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  DialogContentText
 } from '@mui/material';
 import { 
   ArrowBack,
   AccountBalanceWallet,
   AttachMoney,
-  AccountBalance,
   Business,
   Edit,
   Delete,
   Add
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
-import { collection, query, where, getDocs, doc, deleteDoc } from 'firebase/firestore';
+import { 
+  collection, 
+  query, 
+  where, 
+  getDocs, 
+  doc, 
+  deleteDoc,
+  getDoc,
+  addDoc,
+  serverTimestamp,
+  writeBatch
+} from 'firebase/firestore';
 
 function BankAccountList() {
   const navigate = useNavigate();
   const [bankAccounts, setBankAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [deleteDialog, setDeleteDialog] = useState({
+    open: false,
+    accountId: null,
+    accountName: '',
+    bankName: '',
+    accountBalance: 0
+  });
 
   useEffect(() => {
     fetchBankAccounts();
@@ -74,18 +95,173 @@ function BankAccountList() {
     }
   };
 
-  const handleDeleteAccount = async (accountId) => {
-    if (!window.confirm('Are you sure you want to delete this account?')) {
-      return;
+  const handleDeleteClick = (accountId, accountName, bankName, accountBalance) => {
+    setDeleteDialog({
+      open: true,
+      accountId,
+      accountName,
+      bankName,
+      accountBalance: accountBalance || 0
+    });
+  };
+
+  const handleCloseDialog = () => {
+    setDeleteDialog({
+      open: false,
+      accountId: null,
+      accountName: '',
+      bankName: '',
+      accountBalance: 0
+    });
+  };
+
+  const createDeletionTransaction = async (userId, accountId, accountData) => {
+    const accountBalance = accountData.balance || 0;
+    const accountName = accountData.accountName || 'Unknown Account';
+    const bankName = accountData.bankName || 'Bank';
+    
+    // Only create transaction if there's a balance
+    if (accountBalance <= 0) return null;
+
+    // Generate transaction ID (matches your pattern)
+    const transactionId = `txn_del_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // 1. Create transaction document (matches MoneyOutForm pattern)
+    const transactionData = {
+      transacID: transactionId,
+      amount: accountBalance,
+      description: `Account Closure: ${bankName} - ${accountName}`,
+      transacDate: serverTimestamp(),
+      userId: userId,
+      paymentMethodID: 'balance_adjustment', // Same as edit-bank-account
+      bankAccountID: accountId,
+      transactionType: 'OUT', // Money leaving the system
+      createdAt: serverTimestamp(),
+      category: 'account_closure',
+      tags: ['system', 'deletion']
+    };
+
+    await addDoc(collection(db, 'transactions'), transactionData);
+
+    // 2. Create money_out record (matches MoneyOutForm pattern)
+    await addDoc(collection(db, 'money_out'), {
+      transacID: transactionId,
+      spendingCategory: 'account_deletion',
+      debtID: null,
+      userId: userId,
+      createdAt: serverTimestamp(),
+      notes: `Account ${accountName} (${bankName}) was deleted with balance ₱${accountBalance.toFixed(2)}`
+    });
+
+    // 3. Create audit trail (matches your pattern)
+    await addDoc(collection(db, 'bank_account_updates'), {
+      bankAccountID: accountId,
+      previousBalance: accountBalance,
+      newBalance: 0,
+      transactionId: transactionId,
+      changeAmount: accountBalance,
+      changeType: 'ACCOUNT_DELETION',
+      userId: userId,
+      updatedAt: serverTimestamp(),
+      description: `Account ${accountName} deleted`
+    });
+
+    return transactionId;
+  };
+
+  const deleteRelatedRecords = async (accountId, userId) => {
+    try {
+      // Optional: Delete related transactions
+      // You can skip this if you want to keep transaction history
+      const transactionsQuery = query(
+        collection(db, 'transactions'),
+        where('userId', '==', userId),
+        where('bankAccountID', '==', accountId)
+      );
+      
+      const transactionsSnapshot = await getDocs(transactionsQuery);
+      
+      const batch = writeBatch(db);
+      
+      // Delete related transactions and their money_in/money_out records
+      transactionsSnapshot.forEach((transactionDoc) => {
+        const transId = transactionDoc.id;
+        
+        // Delete transaction
+        batch.delete(transactionDoc.ref);
+        
+        // Delete money_in record if exists
+        const moneyInRef = doc(db, 'money_in', transId);
+        batch.delete(moneyInRef);
+        
+        // Delete money_out record if exists
+        const moneyOutRef = doc(db, 'money_out', transId);
+        batch.delete(moneyOutRef);
+      });
+      
+      if (transactionsSnapshot.size > 0) {
+        await batch.commit();
+        console.log(`Deleted ${transactionsSnapshot.size} related transactions`);
+      }
+    } catch (error) {
+      console.error('Error deleting related records:', error);
+      // Don't fail the whole operation if this fails
     }
+  };
+
+  const handleDeleteAccount = async () => {
+    const { accountId, accountName, bankName, accountBalance } = deleteDialog;
+    
+    if (!accountId) return;
 
     try {
-      await deleteDoc(doc(db, 'bank_accounts', accountId));
-      // Refresh list
-      fetchBankAccounts();
+      setLoading(true);
+      
+      const user = auth.currentUser;
+      if (!user) {
+        navigate('/login');
+        return;
+      }
+
+      // 1. Get account data first
+      const accountRef = doc(db, 'bank_accounts', accountId);
+      const accountDoc = await getDoc(accountRef);
+      
+      if (!accountDoc.exists()) {
+        throw new Error('Account not found');
+      }
+
+      const accountData = accountDoc.data();
+
+      // 2. Create a deletion transaction (if there's balance)
+      let transactionId = null;
+      if (accountBalance > 0) {
+        transactionId = await createDeletionTransaction(user.uid, accountId, accountData);
+      }
+
+      // 3. Delete related records (optional - you can comment this out if you want to keep history)
+      // await deleteRelatedRecords(accountId, user.uid);
+
+      // 4. Delete the bank account
+      await deleteDoc(accountRef);
+
+      // 5. Close dialog and refresh
+      handleCloseDialog();
+      await fetchBankAccounts();
+      
+      // Show success message
+      setError(`✅ Account "${accountName}" deleted successfully. ${
+        accountBalance > 0 
+          ? `Transaction recorded for ₱${accountBalance.toLocaleString('en-PH', { minimumFractionDigits: 2 })}.` 
+          : ''
+      }`);
+      setTimeout(() => setError(''), 3000);
+
     } catch (error) {
       console.error('Error deleting account:', error);
-      setError('Failed to delete account');
+      setError(`Failed to delete account: ${error.message}`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -110,7 +286,7 @@ function BankAccountList() {
     }
   };
 
-  if (loading) {
+  if (loading && bankAccounts.length === 0) {
     return (
       <Container sx={{ 
         display: 'flex', 
@@ -158,9 +334,13 @@ function BankAccountList() {
         <Divider sx={{ mt: 2 }} />
       </Box>
 
-      {/* Error Message - NOW WORKS WITH ALERT IMPORT */}
+      {/* Error/Success Messages */}
       {error && (
-        <Alert severity="error" sx={{ mb: 3 }}>
+        <Alert 
+          severity={error.includes('✅') ? "success" : "error"} 
+          sx={{ mb: 3 }}
+          onClose={() => setError('')}
+        >
           {error}
         </Alert>
       )}
@@ -208,7 +388,12 @@ function BankAccountList() {
                 borderRadius: 3, 
                 boxShadow: 2,
                 height: '100%',
-                borderLeft: `4px solid ${account.isCash ? '#34a853' : '#1a73e8'}`
+                borderLeft: `4px solid ${account.isCash ? '#34a853' : '#1a73e8'}`,
+                transition: 'transform 0.2s',
+                '&:hover': {
+                  transform: 'translateY(-4px)',
+                  boxShadow: 4
+                }
               }}>
                 <CardContent>
                   {/* Account Header */}
@@ -247,7 +432,7 @@ function BankAccountList() {
                     </Typography>
                   </Box>
 
-                  {/* Actions - FIXED EDIT BUTTON */}
+                  {/* Actions */}
                   <Box sx={{ display: 'flex', gap: 1, mt: 2 }}>
                     <Button
                       variant="outlined"
@@ -264,7 +449,12 @@ function BankAccountList() {
                         color="error"
                         size="small"
                         startIcon={<Delete />}
-                        onClick={() => handleDeleteAccount(account.id)}
+                        onClick={() => handleDeleteClick(
+                          account.id, 
+                          account.accountName, 
+                          account.bankName, 
+                          account.balance
+                        )}
                         fullWidth
                       >
                         Delete
@@ -312,6 +502,47 @@ function BankAccountList() {
           </Grid>
         </Paper>
       )}
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog
+        open={deleteDialog.open}
+        onClose={handleCloseDialog}
+      >
+        <DialogTitle>Delete Bank Account</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to delete <strong>{deleteDialog.bankName} - {deleteDialog.accountName}</strong>?
+          </DialogContentText>
+          <DialogContentText sx={{ mt: 2, color: 'black', bgcolor: 'warning.light', p: 2, borderRadius: 1 }}>
+            ⚠️ <strong>Warning:</strong> This action will:
+            <ul style={{ marginTop: '8px', marginBottom: '8px' }}>
+              <li>Permanently delete this account</li>
+              <li>
+                {deleteDialog.accountBalance > 0 
+                  ? `Record a final transaction for ₱${deleteDialog.accountBalance.toLocaleString('en-PH', { minimumFractionDigits: 2 })}`
+                  : 'No transaction will be recorded (zero balance)'
+                }
+              </li>
+              { /* <li>Remove all related transaction history</li> */ }
+              <li><strong>This action cannot be undone</strong></li>
+            </ul>
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseDialog} disabled={loading}>
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleDeleteAccount}
+            color="error"
+            variant="contained"
+            disabled={loading}
+            startIcon={loading ? <CircularProgress size={20} /> : <Delete />}
+          >
+            {loading ? 'Deleting...' : 'Delete Account'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 }
